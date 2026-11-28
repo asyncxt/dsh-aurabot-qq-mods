@@ -2,7 +2,9 @@
 //   1. 每条消息必回（group/decide 强制 must）；
 //   2. 给主人完整本机工具（打开宿主既有的 group.ownerTools，只对判定出的群生效）；
 //   3. 单独的模型和思考强度（可选，留空跟随全局）；
-//   4. 规则和上下文注入「小步汇报、改动先等点头」的工作方式。
+//   4. 规则和上下文注入「小步汇报、改动先等点头」的工作方式；
+//   5. 工作群里不发任何表情/贴图（硬拦，不靠她自觉），并把判定结果同步进 group.workGroups，
+//      好让宿主侧已有的「工作群剥掉情绪上下文」那套机制也认得出这些群。
 // 名单在面板里改，不硬编码；群成员定期后台扫描，不阻塞聊天。
 //
 // 工具是怎么给到的：上游 1.3.0 起有 group.ownerTools（off / owner）与 group.ownerToolsGroups。
@@ -36,14 +38,15 @@ export const scanInterval = (v) => Math.max(30, Number(v) || 120)
 export default {
   id: 'workgroup',
   name: '工作群',
-  version: '1.0.0',
+  version: '1.1.0',
   api: 1,
-  description: '成员全在白名单的群自动视为工作群：每条必回、给主人完整本机工具、可用独立模型和思考强度',
+  description: '成员全在白名单的群自动视为工作群：每条必回、给主人完整本机工具、可用独立模型和思考强度，群内不发任何表情',
   defaults: {
     enabled: true,
     whitelist: '',
     intervalSec: 120,
     grantOwnerTools: true,
+    syncWorkGroups: true,
     provider: '',
     model: '',
     reasoningEffort: '',
@@ -62,6 +65,12 @@ export default {
       label: '工作群给主人完整本机工具',
       type: 'switch',
       hint: '打开后由本模块托管 group.ownerTools 和 group.ownerToolsGroups 两个字段；关掉就不再碰它们，也不给工具',
+    },
+    {
+      key: 'syncWorkGroups',
+      label: '把判定结果同步进 group.workGroups',
+      type: 'switch',
+      hint: '上游没有这个字段，写了不生效也不报错；dsh-aurabot-qq 的部分源码分支用它做「工作群剥掉心情/人格上下文」，需要时才开',
     },
     { key: 'provider', label: '工作群模型 provider（留空跟随全局）', type: 'text' },
     { key: 'model', label: '工作群模型名（留空跟随全局）', type: 'text' },
@@ -194,6 +203,20 @@ export default {
           }
         }
 
+        // ---- 名单同步：让宿主侧按 workGroups 做的隔离认得出这几个群 ----
+        // 和上面那档工具开关是两件事，所以单独一段、单独判断有没有变。
+        // 语义注意：workGroups 留空是「没有工作群」，和 ownerToolsGroups 留空（= 所有群）正好相反，
+        // 所以这里空就写空，是安全的。
+        if (s.syncWorkGroups) {
+          const curWg = ((cfg.group || {}).workGroups || []).map(digits).filter(Boolean)
+          const curSet = new Set(curWg)
+          const sameWg = curSet.size === next.length && next.every((v) => curSet.has(v))
+          if (!sameWg) {
+            await api.setConfig({ group: { workGroups: next } })
+            api.log.info(`工作群：group.workGroups 已同步为 ${next.join('、') || '（空）'}`)
+          }
+        }
+
         const key = next.join(',')
         if (key !== lastScan) {
           lastScan = key
@@ -254,15 +277,44 @@ export default {
     // 压不住人设闲聊的口气。两档都给，范围用群号名单钉死。
     api.rule((kind) => {
       if (!api.settings().enabled) return ''
-      if (kind !== 'social' && kind !== 'group-owner') return ''
+      if (kind !== 'social' && kind !== 'group-owner' && kind !== 'workgroup') return ''
       const ids = [...lastWork]
       if (!ids.length) return ''
-      return `【工作群】名单：${ids.join('、')}。你当前所在的群，只要群号在上面这份名单里，你就在「工作群」里干活——那时必须做到：每条消息都要回，不许用 [沉默] 躲开；不要插科打诨、不要卖萌闲聊，说话简短直接，先给结论再给细节；做一小步就汇报一小步，不要攒一大坨再交；要改动任何东西，先说想改什么，等主人点头再动手。当前群号不在名单里时，按普通群聊照常来，这条不作数。`
+      return `【工作群】名单：${ids.join('、')}。你当前所在的群，只要群号在上面这份名单里，你就在「工作群」里干活——那时必须做到：每条消息都要回，不许用 [沉默] 躲开；不发表情、不贴图、不用颜文字和网络热梗；不要插科打诨、不要卖萌闲聊，说话简短直接，先给结论再给细节；做一小步就汇报一小步，不要攒一大坨再交；要改动任何东西，先说想改什么，等主人点头再动手。当前群号不在名单里时，按普通群聊照常来，这条不作数。`
     })
 
     api.context(({ chat }) => {
       if (chat?.kind !== 'group' || !isWork(chat.groupId)) return ''
-      return '【工作状态】这个群是工作群：每条消息都要回应。做一小步就汇报一小步，别攒一大坨再交；有任何改动，先说想改什么，等主人点头再动手。'
+      return '【工作状态】这个群是工作群：每条消息都要回应，但只谈事——不发表情、不卖萌、不说闲话。做一小步就汇报一小步，别攒一大坨再交；有任何改动，先说想改什么，等主人点头再动手。'
+    })
+
+    // ---- 不发表情：工作群里一律摘掉（硬拦，不指望她自己守着）----
+    // 两个出口都拦：reply/items 管她正常的回复（表情是拆段之后才补的，所以这里拦得住），
+    // send 管绕过前者的发送（慢工具提示、模块代发），那一路只到得了最终 OneBot 段。
+    // 认表情段的办法：本地图是 image + sub_type=1，商城表情是 image + emoji_id；
+    // 不带这两个标记的 image 是真图片，不碰。
+    const isStickerSeg = (seg) => {
+      if (!seg || seg.type !== 'image') return false
+      const d = seg.data || {}
+      return d.emoji_id != null || String(d.sub_type ?? '') === '1'
+    }
+    const workChat = (chatId) => {
+      const id = String(chatId || '')
+      return id.startsWith('group:') && isWork(id.slice(6))
+    }
+    api.on('reply/items', (items, { chatId }) => {
+      if (!Array.isArray(items) || !workChat(chatId)) return undefined
+      const kept = items.filter((it) => it?.kind !== 'sticker')
+      if (kept.length === items.length) return undefined
+      api.log.debug(`工作群 ${chatId}：摘掉 ${items.length - kept.length} 张表情`)
+      return kept // 全被摘光就返回空数组：这一轮不发，别拿表情凑数
+    })
+    api.on('send', (message, { chatId }) => {
+      if (!Array.isArray(message) || !workChat(chatId)) return undefined
+      const kept = message.filter((seg) => !isStickerSeg(seg))
+      if (kept.length === message.length) return undefined
+      api.log.debug(`工作群 ${chatId}：最终出口又拦下 ${message.length - kept.length} 段表情`)
+      return kept.length ? kept : null
     })
 
     // ---- 沉默兜底监控：规则已明说工作群不许 [沉默]，真出现就记日志，方便回头看 ----

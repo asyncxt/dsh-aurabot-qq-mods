@@ -89,6 +89,7 @@ test('扫描间隔有下限，非法值回默认', () => {
 test('默认值是安全的：不开工具、跟随全局模型', () => {
   assert.equal(mod.defaults.enabled, true)
   assert.equal(mod.defaults.grantOwnerTools, true)
+  assert.equal(mod.defaults.syncWorkGroups, true)
   assert.equal(mod.defaults.provider, '')
   assert.equal(mod.defaults.model, '')
   assert.equal(mod.defaults.reasoningEffort, '')
@@ -128,7 +129,7 @@ test('setup 是幂等可挂载的：只依赖 api 上文档里有的方法', asy
   // 挂上的东西得是这几样
   assert.deepEqual(calls.every.map((e) => e.name), ['workgroup-scan'])
   assert.equal(calls.every[0].ms, 20_000)
-  assert.deepEqual([...new Set(calls.on)].sort(), ['group/decide', 'model', 'reply'])
+  assert.deepEqual([...new Set(calls.on)].sort(), ['group/decide', 'model', 'reply', 'reply/items', 'send'])
   assert.equal(calls.rule.length, 1)
   assert.equal(calls.context.length, 1)
   assert.deepEqual(calls.command, ['工作群'])
@@ -156,4 +157,89 @@ test('规则只在需要时才吐内容', async () => {
   // 还没扫出任何群：任何档都不吐规则
   assert.equal(rules[0]('social', {}), '')
   assert.equal(rules[0]('group-owner', {}), '')
+  assert.equal(rules[0]('workgroup', {}), '')
+})
+
+// 判出一个工作群需要网关配合：这里用假的群列表 + 成员表顶替，全程离线
+const WORK_GID = '50001'
+const OTHER_GID = '50002'
+function apiWithGroups({ setConfig = [], handlers = {} } = {}) {
+  const state = { workGroups: [] }
+  const api = {
+    config: () => ({ ownerQQ: OWNER, botQQ: BOT, group: { workGroups: state.workGroups }, allow: { groups: [] } }),
+    setConfig: async (patch) => {
+      setConfig.push(patch)
+      if (patch?.group?.workGroups) state.workGroups = patch.group.workGroups
+    },
+    settings: () => ({ ...mod.defaults, whitelist: '30003' }),
+    log: { info() {}, warn() {}, error() {}, debug() {} },
+    every() {},
+    on: (name, fn) => void (handlers[name] = fn),
+    rule() {},
+    context() {},
+    command() {},
+    emit() {},
+    core: {
+      onebot: {
+        state: 'connected',
+        call: async (action, params) => {
+          if (action === 'get_group_list') return [{ group_id: WORK_GID }, { group_id: OTHER_GID }]
+          if (action === 'get_group_member_list') {
+            // OTHER_GID 混了一个名单外的人，所以它不该被判成工作群
+            const extra = String(params?.group_id) === OTHER_GID ? [{ user_id: 99999 }] : []
+            return [{ user_id: OWNER }, { user_id: 30003 }, { user_id: BOT }, ...extra]
+          }
+          return {}
+        },
+      },
+    },
+  }
+  return api
+}
+
+test('判定结果会同步进 group.workGroups', async () => {
+  const setConfig = []
+  const api = apiWithGroups({ setConfig })
+  const handle = await mod.setup(api)
+  // 只有成员全在自己人里的那个群算工作群；混了外人的不算
+  assert.deepEqual(handle.list(), [WORK_GID])
+  const wg = setConfig.find((p) => p?.group?.workGroups)
+  assert.ok(wg, '应该写了一次 group.workGroups')
+  assert.deepEqual(wg.group.workGroups, [WORK_GID])
+})
+
+test('工作群里表情被摘掉，别的群一个字不动', async () => {
+  const handlers = {}
+  const api = apiWithGroups({ handlers })
+  await mod.setup(api)
+  const items = [
+    { kind: 'text', value: '做完了' },
+    { kind: 'sticker', value: '某张表情' },
+  ]
+  // 工作群：表情段被摘掉，文字留下
+  const kept = handlers['reply/items'](items, { chatId: `group:${WORK_GID}`, text: '做完了' })
+  assert.deepEqual(kept, [{ kind: 'text', value: '做完了' }])
+  // 没有表情时返回 undefined（等于不改，别白白复制一遍）
+  assert.equal(handlers['reply/items']([{ kind: 'text', value: '嗯' }], { chatId: `group:${WORK_GID}` }), undefined)
+  // 不在名单里的群 / 私聊：原样放过去
+  assert.equal(handlers['reply/items'](items, { chatId: `group:${OTHER_GID}` }), undefined)
+  assert.equal(handlers['reply/items'](items, { chatId: `private:${OWNER}` }), undefined)
+  // 全被摘光：返回空数组，这一轮不发（不拿表情凑数）
+  assert.deepEqual(handlers['reply/items']([{ kind: 'sticker', value: 'x' }], { chatId: `group:${WORK_GID}` }), [])
+})
+
+test('最终出口也拦表情：本地图 sub_type=1、商城表情 emoji_id，真图片不碰', async () => {
+  const handlers = {}
+  const api = apiWithGroups({ handlers })
+  await mod.setup(api)
+  const localSticker = { type: 'image', data: { file: 'base64://x', sub_type: 1, summary: '[表情]' } }
+  const marketSticker = { type: 'image', data: { emoji_id: 'abc', summary: '[表情]' } }
+  const realPhoto = { type: 'image', data: { file: 'base64://y' } }
+  const text = { type: 'text', data: { text: '干活' } }
+  const out = handlers['send']([text, localSticker, marketSticker, realPhoto], { chatId: `group:${WORK_GID}` })
+  assert.deepEqual(out, [text, realPhoto], '只留下文字和真图片')
+  // 只剩表情：返回 null（整条不发）
+  assert.equal(handlers['send']([localSticker], { chatId: `group:${WORK_GID}` }), null)
+  // 别的群不动
+  assert.equal(handlers['send']([text, localSticker], { chatId: `group:${OTHER_GID}` }), undefined)
 })
